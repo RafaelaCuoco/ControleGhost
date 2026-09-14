@@ -1,0 +1,86 @@
+using Microsoft.Data.SqlClient;
+using System.Data;
+
+public class PoliteEtlPipeline
+{
+    private readonly string _connectionString;
+    
+    // Configurações de "Educação" com o Servidor
+    private const int BATCH_SIZE = 1000;       // Lotes pequenos para o SQL não engasgar
+    private const int DELAY_MS = 200;          // Pausa de 200ms entre lotes (Respira!)
+    private const string READ_HINT = "WITH (READPAST)"; // Não bloqueia a tabela de origem
+
+    public PoliteEtlPipeline(string connectionString) => _connectionString = connectionString;
+
+    public async Task ExecuteAsync(CancellationToken cancellationToken)
+    {
+        // 1. LEITURA (Streaming puro)
+        using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        // O READPAST evita locks. O SequentialAccess evita estourar a RAM.
+        string query = $"SELECT ServicoTomadoId, TagInfNFSe FROM NFe.ServicoTomadoAmbienteNacionalJson {READ_HINT} ORDER BY ServicoTomadoId";
+        
+        using var cmd = new SqlCommand(query, connection);
+        using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken);
+
+        // 2. PREPARAÇÃO DO LOTE (DataTable para o SqlBulkCopy)
+        var batchTable = CreateBatchTable();
+        int rowCount = 0;
+
+        // 3. LOOP PRINCIPAL
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            int id = reader.GetInt32(0);
+            string json = reader.GetString(1); // Lê a string JSON direto do stream
+
+            // Transforma (Consome um pouquinho de CPU, mas não aloca memória)
+            string xml = PoliteConverter.ConvertJsonToXml(json);
+
+            // Adiciona ao lote
+            batchTable.Rows.Add(id, xml);
+            rowCount++;
+
+            // 4. ESCRITA E PAUSA (O controle de ritmo)
+            if (rowCount >= BATCH_SIZE)
+            {
+                await WriteBatchAsync(batchTable, cancellationToken);
+                
+                batchTable.Clear(); // Limpa a memória do lote
+                rowCount = 0;
+
+                // A MÁGICA DA EDUCAÇÃO: Pausa a thread.
+                // Isso dá tempo do SQL Server processar o log, a rede respirar, 
+                // e a CPU da máquina .NET baixar para 0% momentaneamente.
+                await Task.Delay(DELAY_MS, cancellationToken); 
+            }
+        }
+
+        // Processa o resto que sobrou
+        if (rowCount > 0) await WriteBatchAsync(batchTable, cancellationToken);
+    }
+
+    private async Task WriteBatchAsync(DataTable table, CancellationToken ct)
+    {
+        using var bulkCopy = new SqlBulkCopy(_connectionString)
+        {
+            DestinationTableName = "NFe.ServicoTomadoAmbienteNacionalXml",
+            BatchSize = BATCH_SIZE, // Força o SQL a dar commit a cada 1000 linhas
+            BulkCopyTimeout = 300
+        };
+        
+        // Mapeia as colunas
+        bulkCopy.ColumnMappings.Add("ServicoTomadoId", "ServicoTomadoId");
+        bulkCopy.ColumnMappings.Add("TagInfNFSeXml", "TagInfNFSeXml");
+
+        await bulkCopy.WriteToServerAsync(table, ct);
+    }
+
+    private DataTable CreateBatchTable()
+    {
+        var table = new DataTable();
+        table.Columns.Add("ServicoTomadoId", typeof(int));
+        table.Columns.Add("TagInfNFSeXml", typeof(string)); // Ou SqlXml
+        return table;
+    }
+}

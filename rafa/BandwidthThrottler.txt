@@ -1,0 +1,40 @@
+using System.Diagnostics;
+
+public class BandwidthThrottler
+{
+    private readonly long _maxBytesPerSecond;
+    private long _bytesProcessedInWindow;
+    private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+    private readonly object _lock = new();
+
+    public BandwidthThrottler(int maxMegabytesPerSecond)
+    {
+        _maxBytesPerSecond = maxMegabytesPerSecond * 1024L * 1024L;
+    }
+
+    public async Task ThrottleAsync(int bytesProcessed, CancellationToken ct)
+    {
+        lock (_lock)
+        {
+            _bytesProcessedInWindow += bytesProcessed;
+        }
+
+        // Se atingimos o limite e ainda não passou 1 segundo
+        if (_bytesProcessedInWindow >= _maxBytesPerSecond)
+        {
+            long elapsedMs = _stopwatch.ElapsedMilliseconds;
+            if (elapsedMs < 1000)
+            {
+                // Pausa o tempo restante do segundo para "resfriar" a rede
+                int delayMs = 1000 - (int)elapsedMs;
+                await Task.Delay(delayMs, ct); 
+            }
+
+            lock (_lock)
+            {
+                _bytesProcessedInWindow = 0;
+                _stopwatch.Restart();
+            }
+        }
+    }
+}
